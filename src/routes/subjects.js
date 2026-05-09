@@ -1,91 +1,76 @@
 const express = require('express');
 const router = express.Router();
-const db = require('../database');
+const pool = require('../database');
 const auth = require('../middleware/auth');
 
 // جيب كل المواد
-router.get('/', auth, (req, res) => {
+router.get('/', auth, async (req, res) => {
   try {
-    let subjects;
-
+    let result;
     if (req.user.role === 'doctor') {
-      // الدكتور يشوف المواد بتاعته بس
-      subjects = db.prepare(`
-        SELECT s.*, u.name as doctor_name
-        FROM subjects s
-        LEFT JOIN users u ON u.id = s.doctor_id
-        WHERE s.doctor_id = ?
-      `).all(req.user.id);
-
+      result = await pool.query(
+        `SELECT s.*, u.name as doctor_name FROM subjects s
+         LEFT JOIN users u ON u.id = s.doctor_id
+         WHERE s.doctor_id = $1`,
+        [req.user.id]
+      );
     } else if (req.user.role === 'assistant') {
-      // المعيد يشوف المواد اللي هو معيد فيها بس
-      subjects = db.prepare(`
-        SELECT s.*, u.name as doctor_name
-        FROM subjects s
-        LEFT JOIN users u ON u.id = s.doctor_id
-        JOIN subject_assistants sa ON sa.subject_id = s.id
-        WHERE sa.assistant_id = ?
-      `).all(req.user.id);
-
+      result = await pool.query(
+        `SELECT s.*, u.name as doctor_name FROM subjects s
+         LEFT JOIN users u ON u.id = s.doctor_id
+         JOIN subject_assistants sa ON sa.subject_id = s.id
+         WHERE sa.assistant_id = $1`,
+        [req.user.id]
+      );
     } else {
-      // الطالب يشوف كل المواد عشان يسجل
-      subjects = db.prepare(`
-        SELECT s.*, u.name as doctor_name
-        FROM subjects s
-        LEFT JOIN users u ON u.id = s.doctor_id
-      `).all();
+      result = await pool.query(
+        `SELECT s.*, u.name as doctor_name FROM subjects s
+         LEFT JOIN users u ON u.id = s.doctor_id`
+      );
     }
-
-    res.json(subjects);
+    res.json(result.rows);
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
   }
 });
+
 // جيب إعدادات المادة
-router.get('/:id/settings', auth, (req, res) => {
+router.get('/:id/settings', auth, async (req, res) => {
   try {
-    const settings = db.prepare(`
-      SELECT * FROM subject_settings WHERE subject_id = ?
-    `).get(req.params.id);
-
-    res.json(settings || { subject_id: req.params.id, allow_second_midterm: 0 });
+    const result = await pool.query(
+      'SELECT * FROM subject_settings WHERE subject_id = $1',
+      [req.params.id]
+    );
+    res.json(result.rows[0] || { subject_id: req.params.id, allow_second_midterm: 0 });
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
   }
 });
-
 
 // إضافة مادة جديدة (دكتور بس)
-router.post('/', auth, (req, res) => {
+router.post('/', auth, async (req, res) => {
   if (req.user.role !== 'doctor') {
     return res.status(403).json({ message: 'Not authorized' });
   }
-
   const { name, code } = req.body;
-
   if (!name || !code) {
     return res.status(400).json({ message: 'All fields required' });
   }
-
   try {
-    const result = db.prepare(`
-      INSERT INTO subjects (name, code, doctor_id)
-      VALUES (?, ?, ?)
-    `).run(name, code, req.user.id);
-
-    res.status(201).json({ message: '✅ Subject created', subjectId: result.lastInsertRowid });
+    const result = await pool.query(
+      'INSERT INTO subjects (name, code, doctor_id) VALUES ($1, $2, $3) RETURNING id',
+      [name, code, req.user.id]
+    );
+    res.status(201).json({ message: '✅ Subject created', subjectId: result.rows[0].id });
   } catch (err) {
-    if (err.message.includes('UNIQUE')) {
-      // جيب اسم الدكتور اللي عنده المادة دي
-      const existing = db.prepare(`
-        SELECT s.name as subject_name, u.name as doctor_name
-        FROM subjects s
-        JOIN users u ON u.id = s.doctor_id
-        WHERE s.code = ?
-      `).get(code);
-
+    if (err.code === '23505') {
+      const existing = await pool.query(
+        `SELECT s.name as subject_name, u.name as doctor_name
+         FROM subjects s JOIN users u ON u.id = s.doctor_id WHERE s.code = $1`,
+        [code]
+      );
       return res.status(400).json({
-        message: `الكود ده موجود بالفعل، المادة "${existing?.subject_name}" عند د. ${existing?.doctor_name}`
+        message: `الكود ده موجود بالفعل، المادة "${existing.rows[0]?.subject_name}" عند د. ${existing.rows[0]?.doctor_name}`
       });
     }
     res.status(500).json({ message: 'Server error' });
@@ -93,16 +78,16 @@ router.post('/', auth, (req, res) => {
 });
 
 // تعديل مادة (دكتور بس)
-router.patch('/:id', auth, (req, res) => {
+router.patch('/:id', auth, async (req, res) => {
   if (req.user.role !== 'doctor') {
     return res.status(403).json({ message: 'Not authorized' });
   }
   const { name, code } = req.body;
   try {
-    db.prepare(`
-      UPDATE subjects SET name = COALESCE(?, name), code = COALESCE(?, code)
-      WHERE id = ?
-    `).run(name || null, code || null, req.params.id);
+    await pool.query(
+      'UPDATE subjects SET name = COALESCE($1, name), code = COALESCE($2, code) WHERE id = $3',
+      [name || null, code || null, req.params.id]
+    );
     res.json({ message: '✅ Subject updated' });
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
@@ -110,15 +95,16 @@ router.patch('/:id', auth, (req, res) => {
 });
 
 // تسجيل طالب في مادة (دكتور أو معيد)
-router.post('/:subject_id/enroll', auth, (req, res) => {
+router.post('/:subject_id/enroll', auth, async (req, res) => {
   if (req.user.role !== 'doctor' && req.user.role !== 'assistant') {
     return res.status(403).json({ message: 'Not authorized' });
   }
   const { student_id } = req.body;
   try {
-    db.prepare(`
-      INSERT OR IGNORE INTO enrollments (student_id, subject_id) VALUES (?, ?)
-    `).run(student_id, req.params.subject_id);
+    await pool.query(
+      'INSERT INTO enrollments (student_id, subject_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+      [student_id, req.params.subject_id]
+    );
     res.json({ message: '✅ Student enrolled' });
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
@@ -126,15 +112,16 @@ router.post('/:subject_id/enroll', auth, (req, res) => {
 });
 
 // إضافة معيد لمادة (دكتور بس)
-router.post('/:subject_id/assistant', auth, (req, res) => {
+router.post('/:subject_id/assistant', auth, async (req, res) => {
   if (req.user.role !== 'doctor') {
     return res.status(403).json({ message: 'Not authorized' });
   }
   const { assistant_id } = req.body;
   try {
-    db.prepare(`
-      INSERT OR IGNORE INTO subject_assistants (assistant_id, subject_id) VALUES (?, ?)
-    `).run(assistant_id, req.params.subject_id);
+    await pool.query(
+      'INSERT INTO subject_assistants (assistant_id, subject_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+      [assistant_id, req.params.subject_id]
+    );
     res.json({ message: '✅ Assistant added' });
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
@@ -142,14 +129,15 @@ router.post('/:subject_id/assistant', auth, (req, res) => {
 });
 
 // الطالب يسجل نفسه في مادة
-router.post('/:subject_id/self-enroll', auth, (req, res) => {
+router.post('/:subject_id/self-enroll', auth, async (req, res) => {
   if (req.user.role !== 'student') {
     return res.status(403).json({ message: 'Not authorized' });
   }
   try {
-    db.prepare(`
-      INSERT OR IGNORE INTO enrollments (student_id, subject_id) VALUES (?, ?)
-    `).run(req.user.id, req.params.subject_id);
+    await pool.query(
+      'INSERT INTO enrollments (student_id, subject_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+      [req.user.id, req.params.subject_id]
+    );
     res.json({ message: '✅ Enrolled successfully' });
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
@@ -157,21 +145,17 @@ router.post('/:subject_id/self-enroll', auth, (req, res) => {
 });
 
 // تعديل إعدادات المادة (دكتور بس)
-router.patch('/:id/settings', auth, (req, res) => {
+router.patch('/:id/settings', auth, async (req, res) => {
   if (req.user.role !== 'doctor') {
     return res.status(403).json({ message: 'Not authorized' });
   }
-
   const { allow_second_midterm } = req.body;
-
   try {
-    db.prepare(`
-      INSERT INTO subject_settings (subject_id, allow_second_midterm)
-      VALUES (?, ?)
-      ON CONFLICT(subject_id)
-      DO UPDATE SET allow_second_midterm = excluded.allow_second_midterm
-    `).run(req.params.id, allow_second_midterm ? 1 : 0);
-
+    await pool.query(
+      `INSERT INTO subject_settings (subject_id, allow_second_midterm) VALUES ($1, $2)
+       ON CONFLICT(subject_id) DO UPDATE SET allow_second_midterm = $2`,
+      [req.params.id, allow_second_midterm ? 1 : 0]
+    );
     res.json({ message: '✅ Settings updated' });
   } catch (err) {
     res.status(500).json({ message: 'Server error' });

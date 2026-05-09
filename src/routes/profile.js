@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const db = require('../database');
+const pool = require('../database');
 const auth = require('../middleware/auth');
 const multer = require('multer');
 const path = require('path');
@@ -26,26 +26,26 @@ const upload = multer({
 });
 
 // جيب بيانات البروفايل
-router.get('/', auth, (req, res) => {
+router.get('/', auth, async (req, res) => {
   try {
-    const user = db.prepare(`
-      SELECT id, name, email, role, student_id, avatar, created_at
-      FROM users WHERE id = ?
-    `).get(req.user.id);
-    res.json(user);
+    const result = await pool.query(
+      'SELECT id, name, email, role, student_id, avatar, created_at FROM users WHERE id = $1',
+      [req.user.id]
+    );
+    res.json(result.rows[0]);
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
   }
 });
 
 // رفع صورة
-router.post('/avatar', auth, upload.single('avatar'), (req, res) => {
+router.post('/avatar', auth, upload.single('avatar'), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ message: 'No file uploaded' });
   }
   try {
     const avatarUrl = `/uploads/${req.file.filename}`;
-    db.prepare('UPDATE users SET avatar = ? WHERE id = ?').run(avatarUrl, req.user.id);
+    await pool.query('UPDATE users SET avatar = $1 WHERE id = $2', [avatarUrl, req.user.id]);
     res.json({ message: '✅ Avatar updated', avatar: avatarUrl });
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
@@ -53,11 +53,11 @@ router.post('/avatar', auth, upload.single('avatar'), (req, res) => {
 });
 
 // تعديل الاسم
-router.patch('/', auth, (req, res) => {
+router.patch('/', auth, async (req, res) => {
   const { name } = req.body;
   if (!name) return res.status(400).json({ message: 'Name required' });
   try {
-    db.prepare('UPDATE users SET name = ? WHERE id = ?').run(name, req.user.id);
+    await pool.query('UPDATE users SET name = $1 WHERE id = $2', [name, req.user.id]);
     res.json({ message: '✅ Profile updated' });
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
